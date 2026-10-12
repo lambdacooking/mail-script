@@ -175,6 +175,24 @@ def save_mails(mails):
     return path
 
 
+def attach_analysis(mails, config):
+    """credentials.json 에 grok 설정이 있으면 메일마다 Grok 분석 + A 시스템 조회 결과를 붙인다."""
+    if not (config.get("grok") or {}).get("api_key"):
+        return
+    try:
+        from analyzer import analyze_mails
+
+        results = analyze_mails(mails, config)
+    except Exception as e:
+        # 분석이 실패해도 메일 저장은 계속 진행
+        print(f"[오류] 메일 분석 실패: {e}")
+        results = [{"error": str(e)}] * len(mails)
+    for mail, result in zip(mails, results):
+        mail["analysis"] = result
+    failed = sum(1 for result in results if "error" in result)
+    print(f"[분석] {len(mails)}건 중 {len(mails) - failed}건 성공, {failed}건 실패")
+
+
 def main():
     config = load_credentials()
     state = load_state()
@@ -196,6 +214,7 @@ def main():
         mails = [m for m in (fetch_message(imap, uid) for uid in new_uids) if m]
 
         if mails:
+            attach_analysis(mails, config)
             path = save_mails(mails)
             print(f"[새 메일] {len(mails)}건 → {path}")
         else:
