@@ -1,0 +1,7 @@
+[
+  {"name": "무선 마우스", "price": 25000, "stock": 50},
+  {"name": "기계식 키보드", "price": 89000, "stock": 20},
+  {"name": "27인치 모니터", "price": 320000, "stock": 5},
+  {"name": "USB-C 허브", "price": 45000, "stock": 0},
+  {"name": "노트북 거치대", "price": 32000, "stock": 15}
+]

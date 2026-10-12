@@ -1,14 +1,16 @@
 # mail-script
 
 10초마다 네이버 메일(IMAP)의 새 메일을 확인해 로컬에 JSON 파일로 저장하는 스크립트.
-새 메일이 있으면 Grok AI로 본문을 분석해 상품을 유추하고, MCP를 통해 A 시스템에서 해당 상품을 조회합니다.
+새 메일이 있으면 Grok AI로 본문을 분석해 상품명·가격·개수를 유추하고, MCP를 통해 A 시스템에 주문 가능 여부를 조회합니다.
 
 | 파일 | 역할 |
 | --- | --- |
 | `check_mail.py` | 새 메일을 한 번 확인하고, 있으면 분석 후 `mails/mails_YYYYMMDD_HHMMSS_ffffff.json`으로 저장 |
 | `scheduler.py` | `check_mail.py`를 10초마다 실행 |
 | `analyzer.py` | Grok API 호출 + MCP 클라이언트. 메일 본문 분석 및 A 시스템 조회 |
-| `mcp_server_a.py` | A 시스템 상품 조회 MCP 서버 (`analyzer.py`가 자동 실행) |
+| `mcp_server_a.py` | A 시스템 주문 가능 여부 조회 MCP 서버 (`analyzer.py`가 자동 실행) |
+| `system_a_server.py` | A 시스템 웹 서버 (주문 가능 여부 API, 별도 실행) |
+| `system_a_products.json` | A 시스템 상품 목록 (상품명, 판매가, 재고) |
 | `credentials.example.json` | 접속 정보 파일 예시 |
 
 ## 설정
@@ -96,18 +98,22 @@ Grok 분석은 메일 1건당 수 초~수십 초가 걸릴 수 있습니다. 한
       "body_text": "...", "body_html": "...",
       "attachments": [{"filename": "...", "mimeType": "...", "size": 1234}],
       "analysis": {
-        "summary": "무선 마우스 10개 견적 요청",
+        "summary": "무선 마우스 10개 주문 문의",
         "products": [
           {
-            "name_in_mail": "무선마우스 10개",
-            "inferred_product": "무선 마우스",
-            "search_keywords": ["무선 마우스"],
-            "found": true,
-            "matches": [{"id": "P-100", "name": "무선 마우스 M720", "detail": "재고 12"}],
+            "name_in_mail": "무선마우스 10개 (개당 25,000원)",
+            "product_name": "무선마우스",
+            "price": 25000,
+            "quantity": 10,
+            "orderable": true,
+            "reason": "주문 가능합니다.",
+            "system_product": {"name": "무선 마우스", "price": 25000, "stock": 50, "total_price": 250000},
             "note": ""
           }
         ],
-        "tool_calls": [{"tool": "search_products", "arguments": {"keyword": "무선 마우스"}}]
+        "tool_calls": [
+          {"tool": "check_order", "arguments": {"product_name": "무선마우스", "price": 25000, "quantity": 10}}
+        ]
       }
     }
   ]
@@ -124,14 +130,15 @@ Grok 답변이 JSON이 아니면 `{"raw_answer": "..."}`로 원문을 남깁니�
 ```
 check_mail.py ── 새 메일 ──▶ analyzer.py ──(1) 본문 + 도구 목록──▶ Grok API
                                   ▲   │                              │
-                                  │   └──(3) MCP 도구 호출──▶ mcp_server_a.py ──HTTP──▶ A 시스템
-                                  └──────(2) search_products 호출 요청 / (4) 최종 JSON ─┘
+                                  │   └──(3) MCP 도구 호출──▶ mcp_server_a.py ──POST──▶ system_a_server.py
+                                  └──────(2) check_order 호출 요청 / (4) 최종 JSON ─┘
 ```
 
 1. 메일마다 본문(`body_text`, 없으면 HTML에서 추출)과 MCP 도구 목록을 Grok에 보냅니다.
-2. Grok이 문맥에서 상품을 유추하고 `search_products(keyword)` 호출을 요청합니다.
-3. `analyzer.py`가 그 요청을 MCP 서버로 전달하고, MCP 서버가 A 시스템에 HTTP 요청을 보냅니다.
-   결과를 Grok에 돌려주면 Grok은 필요에 따라 키워드를 바꿔 다시 조회합니다 (최대 `max_tool_rounds`회).
+2. Grok이 문맥에서 상품명·단가·개수를 뽑아 `check_order(product_name, quantity, price)` 호출을 요청합니다.
+   단가가 메일에 없으면 `price`는 생략하고, 개수가 없으면 1로 봅니다.
+3. `analyzer.py`가 그 요청을 MCP 서버로 전달하고, MCP 서버가 A 시스템에 POST 요청을 보냅니다.
+   결과를 Grok에 돌려주면 Grok은 상품이 없을 때 상품명 표기를 바꿔 다시 조회할 수 있습니다 (최대 `max_tool_rounds`회).
 4. Grok이 최종 결과를 JSON으로 답하면 메일의 `analysis`에 저장합니다.
 
 ### `grok` 설정
@@ -146,24 +153,76 @@ check_mail.py ── 새 메일 ──▶ analyzer.py ──(1) 본문 + 도구 
 
 모델 이름은 xAI 콘솔의 모델 목록에서 현재 제공되는 ID를 확인해 넣으세요.
 
+### A 시스템 서버 (`system_a_server.py`)
+
+파이썬 기본 라이브러리만으로 동작하는 간단한 웹 서버입니다. 스케줄러와 **별도 터미널에서 먼저 실행**해 두세요.
+
+```bash
+python system_a_server.py                          # http://127.0.0.1:8000
+python system_a_server.py --host 0.0.0.0 --port 9000
+```
+
+**`POST /api/orders/check`**
+
+요청:
+
+```json
+{"product_name": "무선 마우스", "price": 25000, "quantity": 10}
+```
+
+| 필드 | 설명 |
+| --- | --- |
+| `product_name` | 상품명 (필수). 띄어쓰기·대소문자는 무시하고 비교 |
+| `quantity` | 주문 개수, 1 이상의 정수 (필수) |
+| `price` | 요청 단가(원). 생략하면 가격은 검사하지 않음 |
+
+응답 (`200`):
+
+```json
+{
+  "orderable": false,
+  "reason": "재고 부족 (재고 5개, 요청 6개)",
+  "requested": {"product_name": "27인치 모니터", "price": 320000, "quantity": 6},
+  "product": {"name": "27인치 모니터", "price": 320000, "stock": 5, "total_price": 1920000}
+}
+```
+
+판단 기준:
+
+- 등록되지 않은 상품 → 주문 불가 (`product`는 `null`)
+- 재고 < 요청 개수 → 주문 불가
+- 요청 단가 < 판매가 → 주문 불가
+- 모두 통과하면 `"orderable": true`, `"reason": "주문 가능합니다."`
+
+요청 형식이 틀리면 `400`과 `{"error": "..."}`를 돌려줍니다.
+등록된 상품 목록은 `GET /api/products`로 볼 수 있습니다.
+
+상품은 `system_a_products.json`에서 관리합니다. 요청마다 파일을 다시 읽으므로 수정 후 서버를 재시작할 필요가 없습니다.
+
+```json
+[
+  {"name": "무선 마우스", "price": 25000, "stock": 50}
+]
+```
+
+직접 테스트:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/orders/check \
+     -H "Content-Type: application/json" \
+     -d '{"product_name": "무선 마우스", "price": 25000, "quantity": 10}'
+```
+
 ### `system_a` 설정
 
-`mcp_server_a.py`가 A 시스템에 보내는 HTTP 요청을 정합니다.
+`mcp_server_a.py`가 A 시스템 서버에 보내는 요청을 정합니다. 위 서버를 기본 주소로 실행했다면 비워 둬도 됩니다.
 
 | 키 | 설명 | 기본값 |
 | --- | --- | --- |
-| `base_url` | A 시스템 주소 | (필수) |
-| `search_path` | 상품 검색 API 경로 | `/` |
-| `method` | `GET`이면 쿼리스트링, 그 외(`POST` 등)면 JSON 본문으로 전송 | `GET` |
-| `query_param` | 검색어를 담을 파라미터 이름 | `q` |
-| `extra_params` | 항상 함께 보낼 파라미터 (예: `{"size": 20}`) | `{}` |
+| `base_url` | A 시스템 서버 주소 | `http://127.0.0.1:8000` |
+| `check_path` | 주문 가능 여부 API 경로 | `/api/orders/check` |
 | `headers` | 인증 등 추가 헤더 (예: `{"Authorization": "Bearer ..."}`) | `{}` |
-| `timeout` | A 시스템 요청 제한 시간(초) | `10` |
-
-예) `base_url`=`https://a.example.com`, `search_path`=`/api/products`, `query_param`=`keyword`이면
-`GET https://a.example.com/api/products?keyword=무선+마우스` 로 조회합니다.
-
-A 시스템의 응답 본문은 가공하지 않고 Grok에 전달되며(최대 20,000자), Grok이 응답을 읽고 일치하는 상품을 판단합니다.
+| `timeout` | 요청 제한 시간(초) | `10` |
 
 ## 동작 방식
 
@@ -172,5 +231,5 @@ A 시스템의 응답 본문은 가공하지 않고 Grok에 전달되며(최대 
 - 메일함의 `UIDVALIDITY`가 바뀌면 기준점을 현재로 재설정합니다.
 - Grok 분석이 실패해도 메일은 저장되고 기준점도 갱신됩니다 (분석 실패 메일은 다시 분석하지 않음).
 - 메일 본문은 Grok에 분석 대상 데이터로만 전달하며, 본문 속 지시문은 따르지 않도록 지시합니다.
-  Grok이 쓸 수 있는 도구는 A 시스템 **조회**뿐입니다.
+  Grok이 쓸 수 있는 도구는 A 시스템의 주문 가능 여부 **조회**뿐입니다 (실제 주문은 하지 않음).
 - `credentials.json`(메일 비밀번호, Grok API 키, A 시스템 토큰 포함), `state.json`, `mails/`는 `.gitignore`에 포함되어 있습니다.
