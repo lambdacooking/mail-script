@@ -10,11 +10,20 @@
 
 ## 설정
 
-1. 패키지 설치
+1. 가상환경 만들고 패키지 설치
+
+   최신 Debian/Ubuntu 등에서는 시스템 파이썬에 `pip install`을 하면
+   `error: externally-managed-environment` 오류가 납니다. 프로젝트 폴더에 가상환경을 만들어 설치하세요.
 
    ```bash
+   sudo apt install python3-venv     # venv 생성이 실패할 때만 (또는 python3-full)
+   python3 -m venv .venv             # 가상환경 생성 (최초 1회)
+   source .venv/bin/activate         # 가상환경 활성화 (터미널을 새로 열 때마다)
    pip install -r requirements.txt
    ```
+
+   활성화하면 프롬프트 앞에 `(.venv)`가 표시됩니다. 이후 `python` 명령은 모두 활성화된 상태에서 실행합니다.
+   Windows에서는 `.venv\Scripts\activate`로 활성화합니다.
 
 2. 네이버 메일 IMAP 켜기
    - 네이버 메일 → **환경설정 → POP3/IMAP 설정 → IMAP/SMTP 설정** 에서 **IMAP 사용함** 선택 후 저장
@@ -52,6 +61,12 @@
 ```bash
 python scheduler.py               # 10초마다
 python scheduler.py --interval 30 # 간격 변경
+```
+
+가상환경을 활성화하지 않고 실행하려면(cron, systemd 등) 가상환경의 파이썬 경로를 직접 지정하세요.
+
+```bash
+/path/to/mail-script/.venv/bin/python /path/to/mail-script/scheduler.py
 ```
 
 저장 위치를 바꾸려면 환경 변수 `MAIL_OUTPUT_DIR`를 지정하세요.
