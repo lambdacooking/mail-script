@@ -1,50 +1,44 @@
-"""Gmail에서 새 메일을 확인하고, 새 메일이 있으면 JSON 파일로 저장한다.
+"""네이버 메일(IMAP)에서 새 메일을 확인하고, 새 메일이 있으면 JSON 파일로 저장한다.
 
 한 번 실행하면 한 번만 확인하고 종료한다. 주기 실행은 scheduler.py가 담당한다.
 
-새 메일 판별은 Gmail History API(historyId)를 사용한다.
-- 첫 실행: 현재 historyId만 state.json에 기록하고 종료 (기존 메일은 저장하지 않음)
-- 이후 실행: 마지막 historyId 이후 INBOX에 추가된 메일만 가져와 저장
+접속 정보는 credentials.json 에서 읽는다 (credentials.example.json 참고).
+
+새 메일 판별은 IMAP UID를 사용한다.
+- 첫 실행: 현재 마지막 UID만 state.json에 기록하고 종료 (기존 메일은 저장하지 않음)
+- 이후 실행: 마지막 UID보다 큰 메일만 가져와 저장
+- 메일함의 UIDVALIDITY가 바뀌면 UID가 무효이므로 기준점을 재설정
 """
 
-import base64
+import email
+import imaplib
 import json
 import os
 import sys
 from datetime import datetime
+from email.header import decode_header, make_header
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-
 BASE_DIR = Path(__file__).resolve().parent
-CREDENTIALS_FILE = BASE_DIR / "credentials.json"
-TOKEN_FILE = BASE_DIR / "token.json"
+CREDENTIALS_FILE = Path(os.environ.get("MAIL_CREDENTIALS_FILE", BASE_DIR / "credentials.json"))
 STATE_FILE = BASE_DIR / "state.json"
 OUTPUT_DIR = Path(os.environ.get("MAIL_OUTPUT_DIR", BASE_DIR / "mails"))
 
+DEFAULTS = {"imap_server": "imap.naver.com", "imap_port": 993, "mailbox": "INBOX"}
 
-def get_service():
-    creds = None
-    if TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not CREDENTIALS_FILE.exists():
-                sys.exit(f"[오류] {CREDENTIALS_FILE} 가 없습니다. README.md의 설정 방법을 참고하세요.")
-            flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
-            creds = flow.run_local_server(port=0)
-        TOKEN_FILE.write_text(creds.to_json())
-
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+def load_credentials():
+    if not CREDENTIALS_FILE.exists():
+        sys.exit(
+            f"[오류] {CREDENTIALS_FILE} 가 없습니다. "
+            "credentials.example.json 을 복사해 credentials.json 을 만들고 값을 채우세요."
+        )
+    config = {**DEFAULTS, **json.loads(CREDENTIALS_FILE.read_text(encoding="utf-8"))}
+    missing = [key for key in ("username", "password") if not config.get(key)]
+    if missing:
+        sys.exit(f"[오류] {CREDENTIALS_FILE.name} 에 {', '.join(missing)} 값이 없습니다.")
+    return config
 
 
 def load_state():
@@ -59,106 +53,111 @@ def save_state(state):
     tmp.replace(STATE_FILE)
 
 
-def current_history_id(service):
-    return service.users().getProfile(userId="me").execute()["historyId"]
-
-
-def fetch_new_message_ids(service, start_history_id):
-    """start_history_id 이후 INBOX에 추가된 메시지 ID 목록과 최신 historyId를 반환."""
-    message_ids = []
-    latest_history_id = start_history_id
-    page_token = None
-
-    while True:
-        resp = (
-            service.users()
-            .history()
-            .list(
-                userId="me",
-                startHistoryId=start_history_id,
-                historyTypes=["messageAdded"],
-                labelId="INBOX",
-                pageToken=page_token,
-            )
-            .execute()
+def connect(config):
+    imap = imaplib.IMAP4_SSL(config["imap_server"], int(config["imap_port"]))
+    try:
+        imap.login(config["username"], config["password"])
+    except imaplib.IMAP4.error as e:
+        sys.exit(
+            f"[오류] 로그인 실패: {e}\n"
+            "네이버 메일 환경설정에서 IMAP 사용을 켰는지, "
+            "2단계 인증 사용 시 애플리케이션 비밀번호를 넣었는지 확인하세요."
         )
-        latest_history_id = resp.get("historyId", latest_history_id)
-        for record in resp.get("history", []):
-            for added in record.get("messagesAdded", []):
-                msg_id = added["message"]["id"]
-                if msg_id not in message_ids:
-                    message_ids.append(msg_id)
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-
-    return message_ids, latest_history_id
+    return imap
 
 
-def decode_body(data):
-    return base64.urlsafe_b64decode(data.encode()).decode("utf-8", errors="replace")
+def select_mailbox(imap, mailbox):
+    """메일함을 읽기 전용으로 선택하고 UIDVALIDITY를 반환."""
+    status, _ = imap.select(mailbox, readonly=True)
+    if status != "OK":
+        sys.exit(f"[오류] 메일함 '{mailbox}' 를 열 수 없습니다.")
+    _, data = imap.response("UIDVALIDITY")
+    return int(data[0])
 
 
-def extract_bodies(payload):
-    """메시지 payload에서 text/plain, text/html 본문을 추출."""
-    text, html = [], []
-
-    def walk(part):
-        mime = part.get("mimeType", "")
-        data = part.get("body", {}).get("data")
-        if data and not part.get("filename"):
-            if mime == "text/plain":
-                text.append(decode_body(data))
-            elif mime == "text/html":
-                html.append(decode_body(data))
-        for sub in part.get("parts", []):
-            walk(sub)
-
-    walk(payload)
-    return "\n".join(text), "\n".join(html)
+def search_uids(imap, criteria):
+    status, data = imap.uid("SEARCH", None, criteria)
+    if status != "OK" or not data or not data[0]:
+        return []
+    return sorted(int(uid) for uid in data[0].split())
 
 
-def extract_attachments(payload):
-    attachments = []
+def latest_uid(imap):
+    uids = search_uids(imap, "ALL")
+    return uids[-1] if uids else 0
 
-    def walk(part):
-        if part.get("filename"):
+
+def decode_str(value):
+    if value is None:
+        return None
+    try:
+        return str(make_header(decode_header(value)))
+    except Exception:
+        return value
+
+
+def decode_payload(part):
+    payload = part.get_payload(decode=True)
+    if payload is None:
+        return ""
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, errors="replace")
+    except LookupError:
+        return payload.decode("utf-8", errors="replace")
+
+
+def parse_message(uid, raw):
+    msg = email.message_from_bytes(raw)
+    text, html, attachments = [], [], []
+
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        filename = part.get_filename()
+        if filename or part.get_content_disposition() == "attachment":
+            payload = part.get_payload(decode=True) or b""
             attachments.append(
                 {
-                    "filename": part["filename"],
-                    "mimeType": part.get("mimeType"),
-                    "size": part.get("body", {}).get("size"),
-                    "attachmentId": part.get("body", {}).get("attachmentId"),
+                    "filename": decode_str(filename),
+                    "mimeType": part.get_content_type(),
+                    "size": len(payload),
                 }
             )
-        for sub in part.get("parts", []):
-            walk(sub)
+        elif part.get_content_type() == "text/plain":
+            text.append(decode_payload(part))
+        elif part.get_content_type() == "text/html":
+            html.append(decode_payload(part))
 
-    walk(payload)
-    return attachments
-
-
-def get_message(service, msg_id):
-    msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
-    payload = msg.get("payload", {})
-    headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
-    body_text, body_html = extract_bodies(payload)
+    try:
+        date_iso = parsedate_to_datetime(msg["Date"]).isoformat() if msg["Date"] else None
+    except (TypeError, ValueError):
+        date_iso = None
 
     return {
-        "id": msg["id"],
-        "threadId": msg.get("threadId"),
-        "labelIds": msg.get("labelIds", []),
-        "internalDate": datetime.fromtimestamp(int(msg["internalDate"]) / 1000).isoformat(),
-        "from": headers.get("from"),
-        "to": headers.get("to"),
-        "cc": headers.get("cc"),
-        "subject": headers.get("subject"),
-        "date": headers.get("date"),
-        "snippet": msg.get("snippet"),
-        "body_text": body_text,
-        "body_html": body_html,
-        "attachments": extract_attachments(payload),
+        "uid": uid,
+        "message_id": msg["Message-ID"],
+        "from": decode_str(msg["From"]),
+        "to": decode_str(msg["To"]),
+        "cc": decode_str(msg["Cc"]),
+        "subject": decode_str(msg["Subject"]),
+        "date": msg["Date"],
+        "date_iso": date_iso,
+        "body_text": "\n".join(text),
+        "body_html": "\n".join(html),
+        "attachments": attachments,
     }
+
+
+def fetch_message(imap, uid):
+    # BODY.PEEK 를 사용해 메일을 '읽음'으로 바꾸지 않음
+    status, data = imap.uid("FETCH", str(uid), "(BODY.PEEK[])")
+    if status != "OK":
+        return None
+    for item in data:
+        if isinstance(item, tuple):
+            return parse_message(uid, item[1])
+    return None
 
 
 def save_mails(mails):
@@ -177,45 +176,40 @@ def save_mails(mails):
 
 
 def main():
-    service = get_service()
+    config = load_credentials()
     state = load_state()
-
-    if "historyId" not in state:
-        state["historyId"] = current_history_id(service)
-        save_state(state)
-        print(f"[초기화] 기준 historyId={state['historyId']} 저장. 다음 실행부터 새 메일을 확인합니다.")
-        return
+    imap = connect(config)
 
     try:
-        msg_ids, latest_history_id = fetch_new_message_ids(service, state["historyId"])
-    except HttpError as e:
-        # historyId가 너무 오래되면 404가 반환됨 → 기준점을 재설정
-        if e.resp.status == 404:
-            state["historyId"] = current_history_id(service)
+        uid_validity = select_mailbox(imap, config["mailbox"])
+
+        if "last_uid" not in state or state.get("uid_validity") != uid_validity:
+            state = {"uid_validity": uid_validity, "last_uid": latest_uid(imap)}
             save_state(state)
-            print("[경고] historyId 만료. 기준점을 재설정했습니다.")
+            print(f"[초기화] 기준 UID={state['last_uid']} 저장. 다음 실행부터 새 메일을 확인합니다.")
             return
-        raise
 
-    mails = []
-    for msg_id in msg_ids:
+        last_uid = state["last_uid"]
+        # 'N:*' 는 새 메일이 없어도 마지막 메일을 돌려주므로 last_uid 초과만 남김
+        new_uids = [uid for uid in search_uids(imap, f"UID {last_uid + 1}:*") if uid > last_uid]
+
+        mails = [m for m in (fetch_message(imap, uid) for uid in new_uids) if m]
+
+        if mails:
+            path = save_mails(mails)
+            print(f"[새 메일] {len(mails)}건 → {path}")
+        else:
+            print("[확인] 새 메일 없음")
+
+        # 저장이 끝난 뒤에 상태를 갱신해야 실패 시 메일이 누락되지 않음
+        if new_uids:
+            state["last_uid"] = new_uids[-1]
+            save_state(state)
+    finally:
         try:
-            mails.append(get_message(service, msg_id))
-        except HttpError as e:
-            # 확인 사이에 삭제된 메일 등은 건너뜀
-            if e.resp.status == 404:
-                continue
-            raise
-
-    if mails:
-        path = save_mails(mails)
-        print(f"[새 메일] {len(mails)}건 → {path}")
-    else:
-        print("[확인] 새 메일 없음")
-
-    # 저장이 끝난 뒤에 상태를 갱신해야 실패 시 메일이 누락되지 않음
-    state["historyId"] = latest_history_id
-    save_state(state)
+            imap.logout()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
