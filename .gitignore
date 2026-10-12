@@ -1,0 +1,11 @@
+# Gmail OAuth 자격 증명 / 토큰 (절대 커밋 금지)
+credentials.json
+token.json
+
+# 실행 중 생성되는 파일
+state.json
+mails/
+
+__pycache__/
+*.pyc
+.venv/
