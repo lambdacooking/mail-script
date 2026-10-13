@@ -17,7 +17,7 @@ import os
 import sys
 from datetime import datetime
 from email.header import decode_header, make_header
-from email.utils import parsedate_to_datetime
+from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -175,22 +175,49 @@ def save_mails(mails):
     return path
 
 
+def own_addresses(config):
+    """이 스크립트가 쓰는 내 메일 주소들 (내가 보낸 답장이 다시 분석되지 않도록 거르는 데 사용)."""
+    username = config.get("username", "")
+    addresses = {username if "@" in username else f"{username}@naver.com"}
+    from_address = (config.get("reply") or {}).get("from_address")
+    if from_address:
+        addresses.add(from_address)
+    return {a.lower() for a in addresses}
+
+
 def attach_analysis(mails, config):
     """credentials.json 에 grok 설정이 있으면 메일마다 Grok 분석 + A 시스템 조회 결과를 붙인다."""
     if not (config.get("grok") or {}).get("api_key"):
         return
+
+    # 내 주소에서 온 메일(내가 보낸 답장 등)은 분석하지 않음: 답장 → 재분석 → 재주문 루프 방지
+    mine = own_addresses(config)
+    targets = []
+    for mail in mails:
+        if parseaddr(mail.get("from") or "")[1].lower() in mine:
+            mail["analysis"] = {"skipped": "내 메일 주소에서 온 메일이라 분석하지 않았습니다."}
+        else:
+            targets.append(mail)
+    if not targets:
+        print(f"[분석] 내 주소에서 온 메일 {len(mails)}건은 분석하지 않음")
+        return
+
     try:
         from analyzer import analyze_mails
 
-        results = analyze_mails(mails, config)
+        results = analyze_mails(targets, config)
     except Exception as e:
         # 분석이 실패해도 메일 저장은 계속 진행
         print(f"[오류] 메일 분석 실패: {e}")
-        results = [{"error": str(e)}] * len(mails)
-    for mail, result in zip(mails, results):
+        results = [{"error": str(e)}] * len(targets)
+    for mail, result in zip(targets, results):
         mail["analysis"] = result
+        modes = result.get("modes")
+        if modes:
+            print(f"[분석] 적용된 모드: 주문={modes['order']}, 답장={modes['reply']}")
     failed = sum(1 for result in results if "error" in result)
-    print(f"[분석] {len(mails)}건 중 {len(mails) - failed}건 성공, {failed}건 실패")
+    skipped = len(mails) - len(targets)
+    print(f"[분석] {len(targets)}건 중 {len(targets) - failed}건 성공, {failed}건 실패" + (f" (내 메일 {skipped}건 제외)" if skipped else ""))
 
 
 def main():

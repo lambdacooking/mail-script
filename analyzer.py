@@ -35,10 +35,14 @@ MAX_BODY_CHARS = 8000
 SYSTEM_PROMPT = """너는 메일을 분석해 A 시스템에 주문 가능 여부를 조회하고, 확정된 주문은 등록한 뒤 답장하는 주문 담당자다.
 
 1. 메일을 아래 셋 중 하나로 분류한다 (mail_type).
-   - "order"  : 보낸 사람이 구매 의사를 확정한 메일. 예) "주문합니다", "발주드립니다", "주문 확정", "아래와 같이 구매하겠습니다"
-   - "inquiry": 가능 여부·가격·재고·견적을 묻는 메일. 예) "주문 가능할까요?", "견적 부탁드립니다", "재고 있나요?"
+   - "order"  : 보낸 사람이 구매 의사를 밝힌 메일. 예) "주문합니다", "발주드립니다", "주문 확정", "아래와 같이 구매하겠습니다"
+                조건부 주문도 "order" 다. 조건은 check_order 로 확인할 수 있기 때문이다.
+                예) "가능하면 바로 주문할게요", "재고 있으면 보내주세요", "되면 3개 주문합니다"
+                → check_order 결과 조건을 만족하는 상품만 주문하고, 못 만족하면 주문하지 않고 사유를 안내한다.
+   - "inquiry": 가능 여부·가격·재고·견적만 묻고 구매 의사는 밝히지 않은 메일.
+                예) "주문 가능할까요?", "견적 부탁드립니다", "재고 있나요?", "가격이 얼마인가요?"
    - "other"  : 광고·알림·자동발송·상품과 무관한 메일
-   애매하면 "inquiry" 로 본다. 확정 의사가 분명할 때만 "order" 다.
+   구매 의사가 전혀 없으면 "inquiry" 다. 상품·개수가 불분명해 주문 내용을 특정할 수 없을 때도 "inquiry" 로 보고 답장에서 확인을 요청한다.
 2. order/inquiry 이면 메일이 언급하는 상품마다 상품명, 단가(원), 개수를 뽑는다.
    - 단가가 메일에 없으면 price 는 생략한다 (지어내지 않는다).
    - 개수가 메일에 없으면 1 로 보고 note 에 그 사실을 적는다.
@@ -187,6 +191,11 @@ async def analyze_one(session, grok, mcp_tools, mail, config):
 
     def result(data):
         data["tool_calls"] = tool_calls_log
+        # 실제로 적용된 모드 (설정 오타 등으로 기대와 다르게 동작할 때 확인용)
+        data["modes"] = {
+            "order": order_guard.load_order_config(config)["mode"],
+            "reply": reply_tool.load_reply_config(config)["mode"],
+        }
         if order_on:
             # 실제 주문 여부도 Grok의 보고가 아니라 도구 기록을 기준으로 저장
             data["orders"] = guard.records

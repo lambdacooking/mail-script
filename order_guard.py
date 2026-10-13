@@ -12,6 +12,8 @@ LLM이 어떤 인자로 호출하든 아래 규칙은 코드가 강제한다.
 
 import json
 
+from reply_tool import check_mode
+
 ORDER_DEFAULTS = {
     "mode": "dry_run",  # off: place_order 를 Grok에 주지 않음, dry_run: 가상 주문, live: 실제 주문
     "max_orders_per_mail": 5,
@@ -22,8 +24,13 @@ def normalize(name):
     return "".join(str(name).split()).lower()
 
 
+ORDER_MODES = ("off", "dry_run", "live")
+
+
 def load_order_config(config):
-    return {**ORDER_DEFAULTS, **(config.get("order") or {})}
+    order = {**ORDER_DEFAULTS, **(config.get("order") or {})}
+    order["mode"] = check_mode("order", order["mode"], ORDER_MODES)
+    return order
 
 
 def is_enabled(config):

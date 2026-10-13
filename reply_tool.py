@@ -13,6 +13,7 @@ LLM이 도구 인자를 마음대로 정해도 아래 안전장치는 코드가 
 
 import smtplib
 import ssl
+import sys
 from datetime import datetime
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid, parseaddr
@@ -49,8 +50,28 @@ SPEC = {
 }
 
 
+REPLY_MODES = ("off", "dry_run", "send")
+_warned = set()
+
+
+def check_mode(section, value, valid):
+    """모드 값을 정리하고, 알 수 없는 값이면 경고 후 dry_run 으로 동작."""
+    mode = str(value).strip().lower()
+    if mode not in valid:
+        if (section, mode) not in _warned:
+            _warned.add((section, mode))
+            print(
+                f"[경고] credentials.json 의 {section}.mode 값 {value!r} 을(를) 알 수 없어 dry_run 으로 동작합니다. "
+                f"가능한 값: {', '.join(valid)}",
+                file=sys.stderr,
+            )
+        return "dry_run"
+    return mode
+
+
 def load_reply_config(config):
     reply = {**REPLY_DEFAULTS, **(config.get("reply") or {})}
+    reply["mode"] = check_mode("reply", reply["mode"], REPLY_MODES)
     if not reply["from_address"]:
         username = config.get("username", "")
         reply["from_address"] = username if "@" in username else f"{username}@naver.com"
