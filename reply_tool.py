@@ -5,7 +5,7 @@ MCP 서버가 아니라 analyzer.py 안에서 직접 실행하는 로컬 도구�
 
 LLM이 도구 인자를 마음대로 정해도 아래 안전장치는 코드가 강제한다.
 - 받는 사람은 원래 메일의 보낸 사람이어야 함 (다른 주소면 거부)
-- 메일 1건당 답장 1통
+- 메일 1건당 답장은 max_replies_per_mail 통까지 (기본 1)
 - allowed_senders 가 있으면 그 발신자에게만 답장
 - mode 가 dry_run 이면 실제로 보내지 않고 기록만 함
 - 같은 메일에서 주문이 dry_run(가상 주문)이었다면 send 모드여도 보내지 않음
@@ -25,29 +25,34 @@ REPLY_DEFAULTS = {
     "from_address": "",  # 비우면 username@naver.com
     "allowed_senders": [],  # 비우면 모든 발신자에게 답장 허용
     "max_body_chars": 5000,
+    "max_replies_per_mail": 1,  # 메일 1건당 보낼 수 있는 답장 수
 }
 
-SPEC = {
-    "type": "function",
-    "function": {
-        "name": "send_reply",
-        "description": (
-            "지금 분석 중인 메일의 보낸 사람에게 답장을 보낸다. 메일 1건당 한 번만 호출할 수 있다. "
-            "주문·견적·재고 문의처럼 답장이 필요한 메일에만, check_order 조회를 모두 마친 뒤 호출한다. "
-            "광고·알림·자동발송 메일에는 호출하지 않는다. "
-            "결과로 성공 여부(ok)와 거부·실패 사유(error)를 돌려준다."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "to": {"type": "string", "description": "받는 사람 이메일 주소 (원래 메일의 보낸 사람)"},
-                "subject": {"type": "string", "description": "답장 제목. 비우면 'Re: 원래 제목'"},
-                "body": {"type": "string", "description": "답장 본문 (일반 텍스트)"},
+
+def build_spec(max_replies):
+    """Grok에게 보여 줄 send_reply 도구 설명서. 허용 횟수에 맞춰 설명 문구를 만든다."""
+    limit_text = "메일 1건당 한 번만 호출할 수 있다" if max_replies == 1 else f"메일 1건당 최대 {max_replies}번 호출할 수 있다"
+    return {
+        "type": "function",
+        "function": {
+            "name": "send_reply",
+            "description": (
+                f"지금 분석 중인 메일의 보낸 사람에게 답장을 보낸다. {limit_text}. "
+                "주문·견적·재고 문의처럼 답장이 필요한 메일에만, check_order 조회를 모두 마친 뒤 호출한다. "
+                "광고·알림·자동발송 메일에는 호출하지 않는다. "
+                "결과로 성공 여부(ok)와 거부·실패 사유(error)를 돌려준다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string", "description": "받는 사람 이메일 주소 (원래 메일의 보낸 사람)"},
+                    "subject": {"type": "string", "description": "답장 제목. 비우면 'Re: 원래 제목'"},
+                    "body": {"type": "string", "description": "답장 본문 (일반 텍스트)"},
+                },
+                "required": ["to", "body"],
             },
-            "required": ["to", "body"],
         },
-    },
-}
+    }
 
 
 REPLY_MODES = ("off", "dry_run", "send")
@@ -72,6 +77,10 @@ def check_mode(section, value, valid):
 def load_reply_config(config):
     reply = {**REPLY_DEFAULTS, **(config.get("reply") or {})}
     reply["mode"] = check_mode("reply", reply["mode"], REPLY_MODES)
+    try:
+        reply["max_replies_per_mail"] = max(1, int(reply["max_replies_per_mail"]))
+    except (TypeError, ValueError):
+        reply["max_replies_per_mail"] = 1
     if not reply["from_address"]:
         username = config.get("username", "")
         reply["from_address"] = username if "@" in username else f"{username}@naver.com"
@@ -112,14 +121,21 @@ class ReplyTool:
         self.config = config
         self.reply = load_reply_config(config)
         self.order_guard = order_guard
-        self.record = None  # 성공한 답장 기록 (analysis.reply 에 저장)
+        self.limit = self.reply["max_replies_per_mail"]
+        self.records = []  # 성공한 답장 기록 목록 (analysis.replies 에 저장)
+
+    @property
+    def spec(self):
+        return build_spec(self.limit)
 
     def reject(self, reason):
         return {"ok": False, "error": reason}
 
     def __call__(self, args):
-        if self.record is not None:
-            return self.reject("이 메일에는 이미 답장했습니다. 메일 1건당 답장은 한 번만 가능합니다.")
+        if len(self.records) >= self.limit:
+            return self.reject(
+                f"이 메일에는 이미 {len(self.records)}통 답장했습니다. 메일 1건당 답장은 최대 {self.limit}통입니다."
+            )
 
         original_sender = parseaddr(self.mail.get("from") or "")[1].lower()
         to = parseaddr(str(args.get("to") or ""))[1].lower()
@@ -161,8 +177,14 @@ class ReplyTool:
         else:
             record["status"] = "dry_run (실제로 보내지 않음)"
 
-        self.record = record
-        return {"ok": True, "status": record["status"], "to": to, "subject": subject}
+        self.records.append(record)
+        return {
+            "ok": True,
+            "status": record["status"],
+            "to": to,
+            "subject": subject,
+            "remaining_replies": self.limit - len(self.records),
+        }
 
     def default_subject(self):
         original = self.mail.get("subject") or ""

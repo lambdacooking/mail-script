@@ -158,7 +158,7 @@ async def analyze_one(session, grok, mcp_tools, mail, config):
     if reply_tool.is_enabled(config):
         replier = reply_tool.ReplyTool(mail, config, order_guard=guard)
         local_tools["send_reply"] = replier
-        tools.append(reply_tool.SPEC)
+        tools.append(replier.spec)
 
     async def call_mcp(name, args):
         return tool_result_text(await session.call_tool(name, args))
@@ -201,7 +201,7 @@ async def analyze_one(session, grok, mcp_tools, mail, config):
             data["orders"] = guard.records
         if replier is not None:
             # Grok이 뭐라고 답하든, 실제 답장 여부는 도구가 기록한 값을 기준으로 저장
-            data["reply"] = replier.record
+            data["replies"] = replier.records
         return data
 
     for _ in range(int(grok["max_tool_rounds"])):

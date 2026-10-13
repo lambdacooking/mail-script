@@ -133,11 +133,13 @@ Grok 분석은 메일 1건당 수 초~수십 초가 걸릴 수 있습니다. 한
            "ordered": true, "order_id": "ORD-20261013-0001", "product_name": "무선 마우스",
            "unit_price": 25000, "quantity": 10, "total_price": 250000, "remaining_stock": 40}
         ],
-        "reply": {
-          "mode": "send", "status": "sent",
-          "to": "buyer@example.com", "subject": "Re: 발주", "body": "안녕하세요. ...",
-          "message_id": "<...@naver.com>", "at": "2026-10-13T10:00:05.123456"
-        }
+        "replies": [
+          {
+            "mode": "send", "status": "sent",
+            "to": "buyer@example.com", "subject": "Re: 발주", "body": "안녕하세요. ...",
+            "message_id": "<...@naver.com>", "at": "2026-10-13T10:00:05.123456"
+          }
+        ]
       }
     }
   ]
@@ -157,8 +159,8 @@ Grok 답변이 JSON이 아니면 `{"raw_answer": "..."}`로 원문을 남깁니�
 자기 자신에게 테스트 메일을 보내거나 답장이 받은메일함으로 돌아와도, 답장 → 재분석 → 재주문이 반복되지 않게 하기 위해서입니다.
 테스트 주문 메일은 **다른 계정에서** 보내세요.
 
-`orders`와 `reply`는 도구가 실제로 실행된 기록입니다 (`orders`: 주문 시도 결과 목록, `reply`: 답장하지 않았으면 `null`).
-`products[].order_id`, `replied`는 Grok의 자기 보고이므로, 실제 주문·답장 여부는 `orders`/`reply`를 기준으로 보세요.
+`orders`와 `replies`는 도구가 실제로 실행된 기록입니다 (`orders`: 주문 시도 결과 목록, `replies`: 보낸 답장 목록, 답장하지 않았으면 `[]`).
+`products[].order_id`, `replied`는 Grok의 자기 보고이므로, 실제 주문·답장 여부는 `orders`/`replies`를 기준으로 보세요.
 
 ## 메일 분석, 주문, 답장 (에이전트 루프)
 
@@ -233,7 +235,7 @@ Grok이 도구 인자를 어떻게 넣든 아래 규칙은 코드가 강제하�
 | 규칙 | 막는 것 |
 | --- | --- |
 | 받는 사람 = 원래 메일의 보낸 사람 | 메일 본문 속 "xxx로 보내라" 같은 지시(프롬프트 인젝션)로 엉뚱한 곳에 발송 |
-| 메일 1건당 답장 1통 | 같은 사람에게 중복 발송 |
+| 메일 1건당 답장 `max_replies_per_mail`통까지 (기본 1통) | 같은 사람에게 반복 발송 |
 | `allowed_senders` (설정 시) | 허용하지 않은 발신자에게 답장 |
 | 본문 길이 제한 | 비정상적으로 긴 본문 |
 | `mode: dry_run` (기본값) | 검증 전 실제 발송 |
@@ -249,9 +251,10 @@ Grok이 도구 인자를 어떻게 넣든 아래 규칙은 코드가 강제하�
 | `from_address` | 보내는 주소. 비우면 `username@naver.com` | `""` |
 | `allowed_senders` | 이 주소들에게만 답장 허용. 비우면 모두 허용 | `[]` |
 | `max_body_chars` | 답장 본문 최대 길이 | `5000` |
+| `max_replies_per_mail` | 메일 1건당 보낼 수 있는 답장 수 (1 이상). Grok에게 주는 도구 설명에도 이 횟수가 표시됨 | `1` |
 
 SMTP 로그인에는 IMAP과 같은 `username`/`password`를 사용합니다. 네이버 메일 환경설정의 **IMAP/SMTP 설정**에서 SMTP도 사용으로 되어 있어야 합니다.
-처음에는 `dry_run`으로 `mails/*.json`의 `reply.body`를 확인하고, 답장 품질이 괜찮으면 `send`로 바꾸세요.
+처음에는 `dry_run`으로 `mails/*.json`의 `replies[].body`를 확인하고, 답장 품질이 괜찮으면 `send`로 바꾸세요.
 
 ### `grok` 설정
 
