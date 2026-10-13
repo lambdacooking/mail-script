@@ -42,8 +42,7 @@ def build_spec(max_replies, thread_remaining=None):
             "name": "send_reply",
             "description": (
                 f"지금 분석 중인 메일의 보낸 사람에게 답장을 보낸다. {limit_text}. "
-                "주문·견적·재고 문의처럼 답장이 필요한 메일에만, check_order 조회를 모두 마친 뒤 호출한다. "
-                "광고·알림·자동발송 메일에는 호출하지 않는다. "
+                "모든 메일에 반드시 답장한다. 상품 관련 메일이면 check_order·place_order 를 모두 마친 뒤 호출한다. "
                 "결과로 성공 여부(ok)와 거부·실패 사유(error)를 돌려준다."
             ),
             "parameters": {
