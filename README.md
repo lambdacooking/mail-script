@@ -195,6 +195,9 @@ check_mail.py ── 새 메일 ──▶ analyzer.py ──(1) 본문 + 도구 
 
    이 반복은 메일 1건당 최대 `max_tool_rounds`회입니다.
 4. Grok이 더 이상 도구를 호출하지 않고 최종 결과를 JSON으로 답하면 메일의 `analysis`에 저장합니다.
+   단, `mail_type`이 `order`/`inquiry`인데 답장 없이 끝내려 하면 **한 번** "아직 답장하지 않았다"고 되돌려 보냅니다
+   (지시문만으로는 LLM이 답장을 건너뛸 수 있어서 코드로 확인). 그래도 답장하지 않으면 그 판단과 `reply_skipped_reason`을 그대로 기록합니다.
+   재요청이 있었으면 `tool_calls`에 `(reminder)` 항목이 남습니다.
 
 ### `place_order` 안전장치 (`order_guard.py`)
 
