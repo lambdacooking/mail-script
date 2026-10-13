@@ -52,6 +52,16 @@ def post(path_key, product_name, quantity, price):
         return json.dumps(
             {"http_status": e.code, "error": e.read().decode("utf-8", errors="replace")}, ensure_ascii=False
         )
+    except (urllib.error.URLError, OSError) as e:
+        # 서버가 꺼져 있거나 주소가 틀린 경우: 예외를 던지지 않고 Grok이 이해할 수 있는 결과로 돌려줌
+        reason = getattr(e, "reason", e)
+        return json.dumps(
+            {
+                "error": f"A 시스템({config['base_url']})에 연결할 수 없습니다: {reason}",
+                "system_unavailable": True,
+            },
+            ensure_ascii=False,
+        )
 
 
 mcp = MCPServer("system-a")
