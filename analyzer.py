@@ -1,9 +1,11 @@
-"""새 메일 본문을 Grok으로 분석하고, A 시스템 MCP 서버로 주문 가능 여부를 조회한다.
+"""새 메일 본문을 Grok으로 분석하고, A 시스템 MCP 서버로 주문 가능 여부를 조회한 뒤 답장한다.
 
 흐름 (메일 1건마다):
-1. 메일 본문(body_text)과 A 시스템 MCP 도구 목록을 Grok에 전달
-2. Grok이 문맥을 파악해 상품명·가격·개수를 유추하고, 필요한 만큼 check_order 도구를 호출
-3. 도구 호출은 이 스크립트가 MCP 서버로 전달하고 결과를 다시 Grok에 돌려줌
+1. 메일 본문(body_text)과 도구 목록을 Grok에 전달
+   - check_order: A 시스템 MCP 서버의 도구
+   - send_reply : 이 프로세스의 로컬 도구 (reply_tool.py)
+2. Grok이 문맥을 파악해 상품명·가격·개수를 유추하고, check_order 로 조회한 뒤 send_reply 로 답장
+3. 도구 호출은 이 스크립트가 이름에 따라 MCP 서버 또는 로컬 도구로 전달하고 결과를 다시 Grok에 돌려줌
 4. Grok이 최종 결과를 JSON으로 답하면 그 내용을 메일의 "analysis" 항목으로 저장
 """
 
@@ -19,6 +21,8 @@ from pathlib import Path
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+import reply_tool
+
 BASE_DIR = Path(__file__).resolve().parent
 MCP_SERVER_SCRIPT = BASE_DIR / "mcp_server_a.py"
 
@@ -33,7 +37,12 @@ SYSTEM_PROMPT = """너는 메일 내용을 분석해 A 시스템에 주문 가�
    - 개수가 메일에 없으면 1 로 보고 note 에 그 사실을 적는다.
 2. 상품마다 check_order 도구로 A 시스템에 주문 가능 여부를 조회한다.
    product 가 null(등록되지 않은 상품)이면 띄어쓰기, 영문/한글 표기, 일반 명칭 등으로 상품명을 바꿔 다시 조회해도 된다.
-3. 조회가 끝나면 아래 JSON 형식으로만 답한다. 다른 문장은 쓰지 않는다.
+3. send_reply 도구가 있고 메일이 주문·견적·재고 문의라면, 조회 결과를 바탕으로 보낸 사람에게 답장한다.
+   - 정중한 한국어 비즈니스 메일로, 상품별 주문 가능 여부와 사유(재고 부족, 가격 등), 가능한 경우 총액을 알린다.
+   - 조회 결과에 없는 내용(납기, 할인, 배송 등)은 약속하지 않는다.
+   - 광고·알림·자동발송·상품과 무관한 메일에는 답장하지 않는다.
+   - send_reply 가 거부되면 사유를 확인하고, 고칠 수 있으면 고쳐서 다시 호출하고 아니면 포기한다.
+4. 모든 작업이 끝나면 아래 JSON 형식으로만 답한다. 다른 문장은 쓰지 않는다.
 
 {
   "summary": "메일 요지 한두 문장",
@@ -48,7 +57,9 @@ SYSTEM_PROMPT = """너는 메일 내용을 분석해 A 시스템에 주문 가�
       "system_product": {"name": "...", "price": 25000, "stock": 50, "total_price": 250000},
       "note": "판단 근거나 불확실한 점"
     }
-  ]
+  ],
+  "replied": true,
+  "reply_skipped_reason": "답장하지 않았다면 그 이유, 답장했으면 null"
 }
 
 price 를 모르면 null, A 시스템에 상품이 없으면 orderable 은 false, system_product 는 null 로 둔다.
@@ -118,31 +129,51 @@ def tool_result_text(result):
     return text
 
 
-async def analyze_one(session, grok, tools, mail):
+async def analyze_one(session, grok, mcp_tools, mail, config):
+    # 로컬 도구: 이름 → 실행 함수. send_reply 는 메일마다 새로 만들어 '이 메일'에만 답장하도록 묶음
+    local_tools = {}
+    tools = list(mcp_tools)
+    replier = None
+    if reply_tool.is_enabled(config):
+        replier = reply_tool.ReplyTool(mail, config)
+        local_tools["send_reply"] = replier
+        tools.append(reply_tool.SPEC)
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": build_user_message(mail)},
     ]
     tool_calls_log = []
 
+    def result(data):
+        data["tool_calls"] = tool_calls_log
+        if replier is not None:
+            # Grok이 뭐라고 답하든, 실제 답장 여부는 도구가 기록한 값을 기준으로 저장
+            data["reply"] = replier.record
+        return data
+
     for _ in range(int(grok["max_tool_rounds"])):
         message = await asyncio.to_thread(call_grok, grok, messages, tools)
         calls = message.get("tool_calls") or []
         if not calls:
-            return {**parse_final_answer(message.get("content")), "tool_calls": tool_calls_log}
+            return result(parse_final_answer(message.get("content")))
 
         messages.append(message)
         for call in calls:
             name = call["function"]["name"]
             try:
                 args = json.loads(call["function"].get("arguments") or "{}")
-                result_text = tool_result_text(await session.call_tool(name, args))
+                if name in local_tools:
+                    output = await asyncio.to_thread(local_tools[name], args)
+                    result_text = json.dumps(output, ensure_ascii=False)
+                else:
+                    result_text = tool_result_text(await session.call_tool(name, args))
             except Exception as e:
                 args, result_text = call["function"].get("arguments"), f"[도구 호출 실패] {e}"
-            tool_calls_log.append({"tool": name, "arguments": args})
+            tool_calls_log.append({"tool": name, "arguments": args, "result": result_text[:1000]})
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": result_text})
 
-    return {"error": f"도구 호출이 {grok['max_tool_rounds']}회를 넘어 중단했습니다.", "tool_calls": tool_calls_log}
+    return result({"error": f"도구 호출이 {grok['max_tool_rounds']}회를 넘어 중단했습니다."})
 
 
 async def analyze_mails_async(mails, config):
@@ -155,12 +186,12 @@ async def analyze_mails_async(mails, config):
     async with stdio_client(server) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            tools = to_grok_tools((await session.list_tools()).tools)
+            mcp_tools = to_grok_tools((await session.list_tools()).tools)
 
             results = []
             for mail in mails:
                 try:
-                    results.append(await analyze_one(session, grok, tools, mail))
+                    results.append(await analyze_one(session, grok, mcp_tools, mail, config))
                 except Exception as e:
                     # 한 메일의 분석 실패가 다른 메일이나 메일 저장을 막지 않도록 함
                     results.append({"error": str(e)})
