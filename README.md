@@ -13,6 +13,7 @@
 | `mcp_server_a.py` | A 시스템 MCP 서버: `check_order`(조회), `place_order`(주문 등록) (`analyzer.py`가 자동 실행) |
 | `order_guard.py` | `place_order` 호출 안전장치 (조회 후에만 주문, 중복 주문 방지, dry_run) |
 | `reply_tool.py` | Grok이 호출하는 답장 발송 도구 `send_reply` (SMTP, 안전장치 포함) |
+| `threads.py` | 같은 고객과의 대화(스레드) 기록·답장 횟수 추적 (`threads.json`, 자동 생성, git 제외) |
 | `system_a_server.py` | A 시스템 웹 서버 (주문 가능 여부 조회·주문 등록 API, 별도 실행) |
 | `system_a_products.json` | A 시스템 상품 목록 (상품명, 판매가, 등록 재고) |
 | `system_a_orders.json` | A 시스템 주문 내역 (서버가 자동 생성, git 제외) |
@@ -255,6 +256,22 @@ Grok이 도구 인자를 어떻게 넣든 아래 규칙은 코드가 강제하�
 | `allowed_senders` | 이 주소들에게만 답장 허용. 비우면 모두 허용 | `[]` |
 | `max_body_chars` | 답장 본문 최대 길이 | `5000` |
 | `max_replies_per_mail` | 메일 1건당 보낼 수 있는 답장 수 (1 이상). Grok에게 주는 도구 설명에도 이 횟수가 표시됨 | `1` |
+| `max_replies_per_thread` | 같은 고객과의 한 대화에서 보낼 수 있는 답장 수 (1 이상). 아래 "대화(스레드)" 참고 | `10` |
+
+### 대화(스레드)와 답장 한도
+
+고객이 우리 답장에 **회신**하면, 그 메일의 `In-Reply-To`/`References` 헤더에 우리 답장의 `Message-ID`가 들어 있습니다.
+`threads.py`는 고객 메일과 우리 답장의 `Message-ID`를 대화 ID에 연결해 `threads.json`에 기록해 두고, 이걸로 회신이 어느 대화에 속하는지 찾습니다.
+
+- 같은 대화에서 답장은 `max_replies_per_thread`번(기본 10번)까지 나갑니다. 한도에 도달하면 그 뒤 회신에는
+  Grok에게 `send_reply` 도구를 주지 않고, 분석·저장만 합니다 (주문은 `order` 설정대로 처리됨).
+- 회신 메일을 분석할 때는 이전 대화(최근 10개 메시지: 고객 메일과 우리 답장)를 Grok에게 함께 넘깁니다.
+  그래서 "그럼 그걸로 주문할게요" 같은 회신도 앞서 안내한 상품·개수로 이어서 처리합니다.
+- 답장이 아니라 **새로 쓴 메일**은 같은 고객이어도 새 대화로 시작합니다.
+- `dry_run` 답장도 횟수에 포함됩니다 (기록상 보낸 것으로 취급).
+- 메일 JSON에는 `thread_id`와 `analysis.thread`(`is_followup`, `replies_sent_total`, `replies_limit`)가 남고,
+  스케줄러 출력에 `[대화] 기존 대화의 회신, 이 대화의 답장 3/10회`처럼 표시됩니다.
+- 대화 기록을 초기화하려면 스케줄러를 끄고 `threads.json`을 지우세요.
 
 SMTP 로그인에는 IMAP과 같은 `username`/`password`를 사용합니다. 네이버 메일 환경설정의 **IMAP/SMTP 설정**에서 SMTP도 사용으로 되어 있어야 합니다.
 처음에는 `dry_run`으로 `mails/*.json`의 `replies[].body`를 확인하고, 답장 품질이 괜찮으면 `send`로 바꾸세요.
@@ -385,4 +402,4 @@ curl -X POST http://127.0.0.1:8000/api/orders/check \
 - Grok이 쓸 수 있는 도구는 **조회**(`check_order`), **주문 등록**(`place_order`), **답장**(`send_reply`)입니다.
 - 주문·답장 후 처리가 중단되면(시간 초과 등) 기준점이 갱신되지 않아, 다음 실행 때 같은 메일을 다시 처리하면서
   **중복 주문·중복 답장**이 생길 수 있습니다. `live`/`send` 모드에서는 `--timeout`을 넉넉히 두세요.
-- `credentials.json`(메일 비밀번호, Grok API 키, A 시스템 토큰 포함), `state.json`, `mails/`, `system_a_orders.json`은 `.gitignore`에 포함되어 있습니다.
+- `credentials.json`(메일 비밀번호, Grok API 키, A 시스템 토큰 포함), `state.json`, `mails/`, `system_a_orders.json`, `threads.json`은 `.gitignore`에 포함되어 있습니다.

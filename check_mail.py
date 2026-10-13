@@ -137,6 +137,9 @@ def parse_message(uid, raw):
     return {
         "uid": uid,
         "message_id": msg["Message-ID"],
+        # 답장(회신)이면 원래 메일의 Message-ID 가 들어 있음 → 같은 대화(스레드)를 찾는 데 사용
+        "in_reply_to": msg["In-Reply-To"],
+        "references": msg["References"],
         "from": decode_str(msg["From"]),
         "to": decode_str(msg["To"]),
         "cc": decode_str(msg["Cc"]),
@@ -204,8 +207,9 @@ def attach_analysis(mails, config):
 
     try:
         from analyzer import analyze_mails
+        from threads import ThreadStore
 
-        results = analyze_mails(targets, config)
+        results = analyze_mails(targets, config, ThreadStore())
     except Exception as e:
         # 분석이 실패해도 메일 저장은 계속 진행
         print(f"[오류] 메일 분석 실패: {e}")
@@ -215,6 +219,10 @@ def attach_analysis(mails, config):
         modes = result.get("modes")
         if modes:
             print(f"[분석] 적용된 모드: 주문={modes['order']}, 답장={modes['reply']}")
+        thread = result.get("thread")
+        if thread:
+            kind = "기존 대화의 회신" if thread["is_followup"] else "새 대화"
+            print(f"[대화] {kind}, 이 대화의 답장 {thread['replies_sent_total']}/{thread['replies_limit']}회")
     failed = sum(1 for result in results if "error" in result)
     skipped = len(mails) - len(targets)
     print(f"[분석] {len(targets)}건 중 {len(targets) - failed}건 성공, {failed}건 실패" + (f" (내 메일 {skipped}건 제외)" if skipped else ""))

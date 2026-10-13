@@ -6,6 +6,7 @@ MCP 서버가 아니라 analyzer.py 안에서 직접 실행하는 로컬 도구�
 LLM이 도구 인자를 마음대로 정해도 아래 안전장치는 코드가 강제한다.
 - 받는 사람은 원래 메일의 보낸 사람이어야 함 (다른 주소면 거부)
 - 메일 1건당 답장은 max_replies_per_mail 통까지 (기본 1)
+- 같은 고객과의 한 대화(스레드)에서 답장은 max_replies_per_thread 번까지 (기본 10, threads.py 로 횟수 추적)
 - allowed_senders 가 있으면 그 발신자에게만 답장
 - mode 가 dry_run 이면 실제로 보내지 않고 기록만 함
 - 같은 메일에서 주문이 dry_run(가상 주문)이었다면 send 모드여도 보내지 않음
@@ -26,12 +27,15 @@ REPLY_DEFAULTS = {
     "allowed_senders": [],  # 비우면 모든 발신자에게 답장 허용
     "max_body_chars": 5000,
     "max_replies_per_mail": 1,  # 메일 1건당 보낼 수 있는 답장 수
+    "max_replies_per_thread": 10,  # 같은 고객과의 한 대화(스레드)에서 보낼 수 있는 답장 수
 }
 
 
-def build_spec(max_replies):
+def build_spec(max_replies, thread_remaining=None):
     """Grok에게 보여 줄 send_reply 도구 설명서. 허용 횟수에 맞춰 설명 문구를 만든다."""
     limit_text = "메일 1건당 한 번만 호출할 수 있다" if max_replies == 1 else f"메일 1건당 최대 {max_replies}번 호출할 수 있다"
+    if thread_remaining is not None:
+        limit_text += f". 이 고객과의 대화에서 남은 답장 횟수는 {thread_remaining}번이다"
     return {
         "type": "function",
         "function": {
@@ -77,10 +81,11 @@ def check_mode(section, value, valid):
 def load_reply_config(config):
     reply = {**REPLY_DEFAULTS, **(config.get("reply") or {})}
     reply["mode"] = check_mode("reply", reply["mode"], REPLY_MODES)
-    try:
-        reply["max_replies_per_mail"] = max(1, int(reply["max_replies_per_mail"]))
-    except (TypeError, ValueError):
-        reply["max_replies_per_mail"] = 1
+    for key in ("max_replies_per_mail", "max_replies_per_thread"):
+        try:
+            reply[key] = max(1, int(reply[key]))
+        except (TypeError, ValueError):
+            reply[key] = REPLY_DEFAULTS[key]
     if not reply["from_address"]:
         username = config.get("username", "")
         reply["from_address"] = username if "@" in username else f"{username}@naver.com"
@@ -116,17 +121,26 @@ def send_smtp(config, reply, msg):
 class ReplyTool:
     """메일 1건에 대한 send_reply 도구. 메일마다 새로 만든다."""
 
-    def __init__(self, mail, config, order_guard=None):
+    def __init__(self, mail, config, order_guard=None, thread_replies_sent=0):
         self.mail = mail
         self.config = config
         self.reply = load_reply_config(config)
         self.order_guard = order_guard
         self.limit = self.reply["max_replies_per_mail"]
+        self.thread_limit = self.reply["max_replies_per_thread"]
+        self.thread_replies_sent = thread_replies_sent  # 이 대화에서 이전 메일들로 이미 보낸 답장 수
         self.records = []  # 성공한 답장 기록 목록 (analysis.replies 에 저장)
+
+    def thread_remaining(self):
+        return max(0, self.thread_limit - self.thread_replies_sent - len(self.records))
+
+    @property
+    def can_reply(self):
+        return len(self.records) < self.limit and self.thread_remaining() > 0
 
     @property
     def spec(self):
-        return build_spec(self.limit)
+        return build_spec(self.limit, self.thread_remaining())
 
     def reject(self, reason):
         return {"ok": False, "error": reason}
@@ -135,6 +149,10 @@ class ReplyTool:
         if len(self.records) >= self.limit:
             return self.reject(
                 f"이 메일에는 이미 {len(self.records)}통 답장했습니다. 메일 1건당 답장은 최대 {self.limit}통입니다."
+            )
+        if self.thread_remaining() <= 0:
+            return self.reject(
+                f"이 고객과의 대화에서 자동 답장 한도({self.thread_limit}번)를 모두 사용했습니다. 더 이상 답장할 수 없습니다."
             )
 
         original_sender = parseaddr(self.mail.get("from") or "")[1].lower()
@@ -183,7 +201,7 @@ class ReplyTool:
             "status": record["status"],
             "to": to,
             "subject": subject,
-            "remaining_replies": self.limit - len(self.records),
+            "remaining_replies": min(self.limit - len(self.records), self.thread_remaining()),
         }
 
     def default_subject(self):

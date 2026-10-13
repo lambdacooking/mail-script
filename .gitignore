@@ -5,6 +5,7 @@ credentials.json
 state.json
 mails/
 system_a_orders.json
+threads.json
 
 __pycache__/
 *.pyc
