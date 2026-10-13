@@ -4,6 +4,7 @@ credentials.json
 # 실행 중 생성되는 파일
 state.json
 mails/
+system_a_orders.json
 
 __pycache__/
 *.pyc

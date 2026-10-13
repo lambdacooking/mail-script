@@ -8,6 +8,7 @@ LLM이 도구 인자를 마음대로 정해도 아래 안전장치는 코드가 
 - 메일 1건당 답장 1통
 - allowed_senders 가 있으면 그 발신자에게만 답장
 - mode 가 dry_run 이면 실제로 보내지 않고 기록만 함
+- 같은 메일에서 주문이 dry_run(가상 주문)이었다면 send 모드여도 보내지 않음
 """
 
 import smtplib
@@ -85,10 +86,11 @@ def send_smtp(config, reply, msg):
 class ReplyTool:
     """메일 1건에 대한 send_reply 도구. 메일마다 새로 만든다."""
 
-    def __init__(self, mail, config):
+    def __init__(self, mail, config, order_guard=None):
         self.mail = mail
         self.config = config
         self.reply = load_reply_config(config)
+        self.order_guard = order_guard
         self.record = None  # 성공한 답장 기록 (analysis.reply 에 저장)
 
     def reject(self, reason):
@@ -125,12 +127,16 @@ class ReplyTool:
             "at": datetime.now().isoformat(),
         }
 
-        if self.reply["mode"] == "send":
+        # 주문이 dry_run(가상 주문)이었다면 답장에 가짜 주문번호가 들어 있으므로 실제 발송하지 않음
+        simulated_order = self.order_guard is not None and self.order_guard.simulated
+        if self.reply["mode"] == "send" and not simulated_order:
             try:
                 send_smtp(self.config, self.reply, msg)
             except Exception as e:
                 return self.reject(f"발송 실패: {e}")
             record["status"] = "sent"
+        elif self.reply["mode"] == "send":
+            record["status"] = "dry_run (주문이 dry_run이라 가짜 주문번호가 나가지 않도록 발송 보류)"
         else:
             record["status"] = "dry_run (실제로 보내지 않음)"
 
